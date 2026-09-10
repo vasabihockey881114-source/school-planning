@@ -1,0 +1,7 @@
+BOT_TOKEN = ""
+
+
+ADMINS = [
+    
+    ""
+]
