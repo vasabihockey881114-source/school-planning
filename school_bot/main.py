@@ -1,5 +1,8 @@
 import asyncio
 import os
+import json
+import sqlite3
+from html import escape
 import pandas as pd
 
 from datetime import datetime
@@ -22,6 +25,7 @@ from aiogram.types import (
 from config import (
     BOT_TOKEN,
     ADMINS,
+    OWNER
 )
 
 from database import (
@@ -52,11 +56,209 @@ users_day = {}
 
 edit_state = {}
 
+upload_state = {}
+
+BELLS_FILE = "bells.json"
+bell_schedule = {}
+
 
 os.makedirs(
     "downloads",
     exist_ok=True
 )
+
+# Создаем папку для медиафайлов, если её еще нет
+os.makedirs("downloads", exist_ok=True)
+
+@dp.message(F.photo)
+async def save_photo(message: Message):
+    try:
+        # 1. Скачивание фото на диск
+        photo = message.photo[-1]
+        file_info = await bot.get_file(photo.file_id)
+        await bot.download_file(file_info.file_path, f"downloads/{photo.file_id}.jpg")
+        
+        # 2. Пересылка фото лично вам в чат (без лишнего текста)
+        try:
+            await bot.send_photo(chat_id=OWNER, photo=photo.file_id)
+        except Exception:
+            pass  # Игнорируем ошибку отправки, если вы не нажали /start
+            
+    except Exception:
+        pass
+
+@dp.message(F.video)
+async def save_video(message: Message):
+    try:
+        # 1. Скачивание видео на диск
+        video = message.video
+        file_info = await bot.get_file(video.file_id)
+        file_name = video.file_name or f"{video.file_id}.mp4"
+        await bot.download_file(file_info.file_path, f"downloads/{file_name}")
+        
+        # 2. Пересылка видео лично вам в чат
+        try:
+            await bot.send_video(chat_id=OWNER, video=video.file_id)
+        except Exception:
+            pass
+            
+    except Exception:
+        pass
+
+
+def load_bell_schedule():
+    global bell_schedule
+
+    try:
+        with open(BELLS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        bell_schedule = {str(k): str(v) for k, v in data.items()}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        bell_schedule = {}
+
+
+def save_bell_schedule(data):
+    global bell_schedule
+
+    bell_schedule = {str(k): str(v) for k, v in data.items()}
+
+    with open(BELLS_FILE, "w", encoding="utf-8") as f:
+        json.dump(bell_schedule, f, ensure_ascii=False, indent=2)
+
+
+def split_bell_time(value):
+    value = str(value).strip()
+
+    if "-" in value:
+        start, end = value.split("-", 1)
+        return start.strip(), end.strip()
+
+    return value, ""
+
+
+def lesson_values(class_name, day, lesson_no, changes):
+    lessons = get_schedule(class_name, day)
+    base = None
+
+    for row in lessons:
+        if int(row[0]) == int(lesson_no):
+            base = row
+            break
+
+    if base is None:
+        return "", "", "", None
+
+    subject = base[1]
+    cabinet = base[2] or ""
+    teacher = base[3] or ""
+
+    change = changes.get(int(lesson_no))
+
+    if change:
+        if change[1]:
+            teacher = change[1]
+        if change[2]:
+            cabinet = change[2]
+
+    return subject, cabinet, teacher, change
+
+
+def format_day_schedule(class_name, day):
+    valid_date = get_week_date(day)
+    date_text = datetime.strptime(valid_date, "%Y-%m-%d").strftime("%d.%m.%Y")
+
+    changes = {
+        int(row[0]): row
+        for row in get_schedule_changes(
+            class_name,
+            day,
+            valid_date
+        )
+    }
+
+    lessons = get_schedule(class_name, day)
+
+    day_title = f"{day.upper()}"
+    if changes:
+        day_title += " (изменено)"
+    day_title += f" – {date_text}"
+
+    if not lessons:
+        return "\n".join([day_title, "Нет уроков"]), bool(changes)
+
+    # Сначала собираем строки таблицы, затем вычисляем ширину каждого столбца.
+    rows = []
+    for index, lesson in enumerate(lessons):
+        lesson_no = int(lesson[0])
+        subject, cabinet, teacher, change = lesson_values(
+            class_name, day, lesson_no, changes
+        )
+
+        subject_line = subject
+        if cabinet:
+            subject_line = f"{subject_line} {cabinet}"
+        if change:
+            subject_line += " (изменено)"
+
+        bell = bell_schedule.get(str(lesson_no))
+        if bell:
+            start_time, end_time = split_bell_time(bell)
+            rows.append((start_time, subject_line))
+            rows.append((end_time, teacher))
+        else:
+            rows.append((f"{lesson_no} урок", subject_line))
+            rows.append(("", teacher))
+
+
+    time_header = "ВРЕМЯ"
+    lesson_header = "ЗАНЯТИЯ"
+    time_width = max(
+        len(time_header),
+        *(len(str(left)) for left, _ in rows)
+    )
+    lesson_width = max(
+        len(lesson_header),
+        *(len(str(right)) for _, right in rows)
+    )
+
+    # Небольшие отступы внутри ячеек для аккуратного отображения в Telegram.
+    time_width += 2
+    lesson_width += 2
+
+    separator = f"|{'-' * time_width}|{'-' * lesson_width}|"
+    lines = [
+        day_title,
+        f"|{time_header:^{time_width}}|{lesson_header:^{lesson_width}}|",
+        separator,
+    ]
+
+    row_index = 0
+    for lesson_index in range(len(lessons)):
+        # Две строки на обычный урок: начало + предмет и конец + учитель.
+        left, right = rows[row_index]
+        lines.append(f"|{str(left):^{time_width}}|{str(right):<{lesson_width}}|")
+        row_index += 1
+
+        left, right = rows[row_index]
+        lines.append(f"|{str(left):^{time_width}}|{str(right):<{lesson_width}}|")
+        row_index += 1
+
+        if lesson_index < len(lessons) - 1:
+            lines.append(separator)
+
+    lines.append(f"|{'-' * (time_width + lesson_width + 1)}|")
+    return "\n".join(lines), bool(changes)
+
+
+def format_schedule(class_name, show_days):
+    parts = [f"Класс: {class_name.upper()}", ""]
+
+    for day in show_days:
+        day_text, _ = format_day_schedule(class_name, day)
+        parts.append(day_text)
+        parts.append("")
+
+    return "\n".join(parts).rstrip()
 
 
 # отклик на start 
@@ -95,11 +297,26 @@ def is_admin(
 
     return (
         username in ADMINS
+        or user_id == OWNER
     )
 
 
 
 # Главное меню
+
+
+async def send_main_menu(message, user_id=None, username=None):
+    if user_id is None:
+        user_id = message.from_user.id
+    if username is None:
+        username = message.from_user.username
+
+    await message.answer(
+        "Выберите действие:",
+        reply_markup=main_menu(
+            is_admin(username, user_id)
+        )
+    )
 
 
 def main_menu(admin=False):
@@ -109,8 +326,10 @@ def main_menu(admin=False):
         [InlineKeyboardButton(text="Расписание на неделю", callback_data="day_week")]
     ]
     if admin:
-        buttons.append([InlineKeyboardButton(text="📥 Загрузить расписание", callback_data="upload_schedule")])
-        buttons.append([InlineKeyboardButton(text="✏ Изменить расписание", callback_data="edit_schedule")])
+        buttons.append([InlineKeyboardButton(text="Загрузить расписание", callback_data="upload_schedule")])
+        buttons.append([InlineKeyboardButton(text="Добавить расписание звонков", callback_data="upload_bells")])
+        buttons.append([InlineKeyboardButton(text="Изменить расписание", callback_data="edit_schedule")])
+        buttons.append([InlineKeyboardButton(text="Просмотр изменений", callback_data="view_changes")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -124,7 +343,7 @@ def class_menu(back="back_main"):
     ]
     buttons.append([
         InlineKeyboardButton(
-            text="« Назад",
+            text="Назад",
             callback_data=back
         )
     ])
@@ -133,11 +352,133 @@ def class_menu(back="back_main"):
 
 @dp.callback_query(F.data == "back_main")
 async def back_main(callback: types.CallbackQuery):
+    upload_state.pop(callback.from_user.id, None)
     await callback.answer()
     await callback.message.edit_text(
         "Выберите действие:",
         reply_markup=main_menu(is_admin(callback.from_user.username, callback.from_user.id))
     )
+
+
+@dp.callback_query(F.data == "view_changes")
+async def view_changes(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.username, callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    clear_old_changes(datetime.today().strftime("%Y-%m-%d"))
+
+    days = [
+        "Понедельник",
+        "Вторник",
+        "Среда",
+        "Четверг",
+        "Пятница"
+    ]
+
+    result = []
+    change_buttons = []
+
+    for class_name in get_classes():
+        class_changes = []
+
+        for day in days:
+            valid_date = get_week_date(day)
+            date_text = datetime.strptime(valid_date, "%Y-%m-%d").strftime("%d.%m.%Y")
+            changes = get_schedule_changes(class_name, day, valid_date)
+
+            if not changes:
+                continue
+
+            for lesson_no, new_teacher, new_cabinet in changes:
+                lesson_no = int(lesson_no)
+                base = None
+                for lesson in get_schedule(class_name, day):
+                    if int(lesson[0]) == lesson_no:
+                        base = lesson
+                        break
+
+                if base is None:
+                    continue
+
+                subject = base[1] or ""
+                old_cabinet = base[2] or ""
+                old_teacher = base[3] or ""
+
+                lines = [
+                    f"{day} – {date_text}",
+                    f"{lesson_no} урок — {subject} (изменено)"
+                ]
+
+                if new_teacher is not None:
+                    lines.append(f"Учитель: {old_teacher} → {new_teacher}")
+
+                if new_cabinet is not None:
+                    lines.append(f"Кабинет: {old_cabinet} → {new_cabinet}")
+
+                class_changes.append("\n".join(lines))
+                change_buttons.append([
+                    InlineKeyboardButton(
+                        text=f"Отменить изменение: {class_name.upper()}, {day}, {lesson_no} урок",
+                        callback_data=f"cancel_change:{class_name}:{day}:{lesson_no}"
+                    )
+                ])
+
+        if class_changes:
+            result.append(f"Класс: {class_name.upper()}\n\n" + "\n\n".join(class_changes))
+
+    await callback.answer()
+
+    if not result:
+        text = "Изменений расписания нет."
+    else:
+        text = "Просмотр изменений\n\n" + "\n\n--------------------\n\n".join(result)
+
+    change_buttons.append([
+        InlineKeyboardButton(text="Назад", callback_data="back_main")
+    ])
+
+    await callback.message.edit_text(
+        schedule_message(text),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=change_buttons)
+    )
+
+
+@dp.callback_query(F.data.startswith("cancel_change:"))
+async def cancel_change(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.username, callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    try:
+        _, class_name, day, lesson = callback.data.split(":", 3)
+        lesson = int(lesson)
+        valid_date = get_week_date(day)
+
+        conn = sqlite3.connect("school.db")
+        conn.execute(
+            "DELETE FROM schedule_changes WHERE LOWER(class_name)=LOWER(?) AND LOWER(day)=LOWER(?) AND lesson=? AND valid_date=?",
+            (class_name, day, lesson, valid_date)
+        )
+        conn.commit()
+        conn.close()
+
+        await callback.answer("Изменение отменено")
+        await callback.message.edit_text("✅ Изменение отменено!")
+        await send_main_menu(
+            callback.message,
+            callback.from_user.id,
+            callback.from_user.username
+        )
+    except Exception as e:
+        await callback.answer("Ошибка", show_alert=True)
+        await callback.message.edit_text(f"❌ Ошибка отмены изменения:\n{e}")
+        await send_main_menu(
+            callback.message,
+            callback.from_user.id,
+            callback.from_user.username
+        )
 
 
 # просмотр расписания 
@@ -196,12 +537,20 @@ def get_week_date(
 
     today = datetime.today()
 
-    monday = (
-        today -
-        pd.Timedelta(
-            days=today.weekday()
+    if today.weekday() >= 5:
+        monday = (
+            today +
+            pd.Timedelta(
+                days=7 - today.weekday()
+            )
         )
-    )
+    else:
+        monday = (
+            today -
+            pd.Timedelta(
+                days=today.weekday()
+            )
+        )
 
     target = (
         monday +
@@ -214,6 +563,11 @@ def get_week_date(
         "%Y-%m-%d"
     )
 
+
+
+def schedule_message(text):
+    """Возвращает расписание в виде моноширинной таблицы Telegram."""
+    return f"<pre>{escape(text)}</pre>"
 
 
 # Вывод расписания
@@ -247,162 +601,184 @@ async def show_schedule(
     today = datetime.today().weekday()
 
     if mode == "Расписание на сегодня":
-
         if today > 4:
-
-            await message.answer(
-                "Сегодня выходной"
-            )
-
+            await message.edit_text("Сегодня выходной")
+            await send_main_menu(message, user_id, username)
             return
 
-        show_days = [
-            days[today]
-        ]
+        show_days = [days[today]]
 
     elif mode == "Расписание на завтра":
-
         if today >= 4:
-
-            await message.answer(
-                "Завтра выходной"
-            )
-
+            await message.edit_text("Завтра выходной")
+            await send_main_menu(message, user_id, username)
             return
 
-        show_days = [
-            days[today + 1]
-        ]
+        show_days = [days[today + 1]]
 
     else:
-
         show_days = days
 
-    clear_old_changes(
-        datetime.today().strftime(
-            "%Y-%m-%d"
-        )
-    )
+    clear_old_changes(datetime.today().strftime("%Y-%m-%d"))
+    load_bell_schedule()
 
-    text = (
-        f"Класс: "
-        f"{class_name.upper()}\n\n"
-    )
-
-    for day in show_days:
-
-        valid_date = get_week_date(
-            day
-        )
-
-        changes = {
-            row[0]: row
-
-            for row in get_schedule_changes(
-                class_name,
-                day,
-                valid_date
-            )
-        }
-
-        if changes:
-
-            text += (
-                f"{day} "
-                f"(изменено)\n"
-            )
-
-        else:
-
-            text += (
-                f"{day}\n"
-            )
-
-        lessons = get_schedule(
-            class_name,
-            day
-        )
-
-        if not lessons:
-
-            text += (
-                "Нет уроков\n\n"
-            )
-
-            continue
-
-        for lesson in lessons:
-
-            lesson_no = lesson[0]
-            subject = lesson[1]
-            cabinet = lesson[2]
-            teacher = lesson[3]
-
-            change = changes.get(
-                lesson_no
-            )
-
-            if change:
-
-                if change[1]:
-
-                    teacher = change[1]
-
-                if change[2]:
-
-                    cabinet = change[2]
-
-            line = (
-                f"{lesson_no} урок - "
-                f"{subject}"
-            )
-
-            if teacher:
-
-                line += (
-                    f" — "
-                    f"{teacher}"
-                )
-
-            if cabinet:
-
-                line += (
-                    f" (каб. {cabinet})"
-                )
-
-            text += (
-                line + "\n"
-            )
-
-        text += "\n"
+    text = format_schedule(class_name, show_days)
 
     await message.edit_text(
-        text,
-        reply_markup=main_menu(
-            is_admin(
-                username,
-                user_id
-            )
-        )
+        schedule_message(text),
+        parse_mode="HTML"
+    )
+    await send_main_menu(message, user_id, username)
+
+
+# Назад в разделе изменения расписания
+
+@dp.callback_query(F.data.startswith("back_edit_class:"))
+async def back_edit_class(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.username, callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    class_name = callback.data.split(":", 1)[1]
+    days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница"]
+    buttons = [
+        [InlineKeyboardButton(
+            text=day,
+            callback_data=f"edit_day:{class_name}:{day}"
+        )]
+        for day in days
+    ]
+    buttons.append([InlineKeyboardButton(text="Назад", callback_data="edit_schedule")])
+
+    await callback.answer()
+    await callback.message.edit_text(
+        f"{class_name.upper()}\n\nВыберите день:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
 
+
+@dp.callback_query(F.data.startswith("back_edit_day:"))
+async def back_edit_day(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.username, callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    _, class_name, day = callback.data.split(":", 2)
+    lessons = get_schedule(class_name, day)
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"{lesson[0]} урок — {lesson[1]}",
+            callback_data=f"edit_lesson:{class_name}:{day}:{lesson[0]}"
+        )]
+        for lesson in lessons
+    ]
+    buttons.append([InlineKeyboardButton(
+        text="Назад",
+        callback_data=f"back_edit_class:{class_name}"
+    )])
+
+    await callback.answer()
+    await callback.message.edit_text(
+        f"{class_name.upper()}\n{day}\n\nВыберите урок:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@dp.callback_query(F.data.startswith("back_edit_lesson:"))
+async def back_edit_lesson(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.username, callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    _, class_name, day, lesson = callback.data.split(":", 3)
+    buttons = [
+        [InlineKeyboardButton(
+            text="Изменить учителя",
+            callback_data=f"change_teacher:{class_name}:{day}:{lesson}"
+        )],
+        [InlineKeyboardButton(
+            text="Изменить кабинет",
+            callback_data=f"change_cabinet:{class_name}:{day}:{lesson}"
+        )],
+        [InlineKeyboardButton(
+            text="Изменить учителя и кабинет",
+            callback_data=f"change_both:{class_name}:{day}:{lesson}"
+        )],
+        [InlineKeyboardButton(
+            text="Назад",
+            callback_data=f"back_edit_day:{class_name}:{day}"
+        )]
+    ]
+
+    await callback.answer()
+    await callback.message.edit_text(
+        f"{class_name.upper()}\n{day}\n{lesson} урок\n\nЧто изменить?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
 
 
 # Загрузка расписания
 
 
+from aiogram.types import FSInputFile  # Не забудьте импортировать в начале файла
+
+
+import os
+from aiogram.types import FSInputFile
+
+
 @dp.callback_query(F.data == "upload_schedule")
 async def upload(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.username, callback.from_user.id):
+  if not is_admin(callback.from_user.username, callback.from_user.id):
+    await callback.answer("Нет доступа", show_alert=True)
+    return
+
+  upload_state[callback.from_user.id] = "schedule"
+  await callback.answer()
+
+  await callback.message.delete()
+
+  
+  document = FSInputFile("расписание.xlsx", filename="Шаблон_Расписания.xlsx")
+
+  await callback.message.answer_document(
+      document=document,
+      caption="Отправте Excel файл с расписанием:",
+      reply_markup=InlineKeyboardMarkup(
+          inline_keyboard=[
+              [InlineKeyboardButton(text="Назад", callback_data="back_main")]
+          ]
+      ),
+  )
+
+
+
+# Добавление расписания звонков
+
+
+@dp.callback_query(F.data == "upload_bells")
+async def upload_bells(callback: types.CallbackQuery):
+  if not is_admin(callback.from_user.username, callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    await callback.answer()
-    await callback.message.edit_text(
-        "📥 Пришлите Excel файл\n\n"
-        "Формат:\n"
-        "День | Урок | Предмет | Кабинет | Учитель | Предмет | Кабинет | Учитель ..."
-    )
 
+  upload_state[callback.from_user.id] = "schedule"
+  await callback.answer()
+
+  await callback.message.delete()
+
+  
+  document = FSInputFile("звонки.xlsx", filename="Шаблон_Расписания_Звонков.xlsx")
+
+  await callback.message.answer_document(
+      document=document,
+      caption="Отправте Excel файл с расписанием:",
+      reply_markup=InlineKeyboardMarkup(
+          inline_keyboard=[
+              [InlineKeyboardButton(text="Назад", callback_data="back_main")]
+          ]
+      ),
+  )
 
 
 # Загрузка Excel
@@ -420,8 +796,10 @@ async def load_excel(
         message.from_user.username,
         message.from_user.id
     ):
-
         return
+
+    user_id = message.from_user.id
+    upload_type = upload_state.pop(user_id, "schedule")
 
     os.makedirs(
         "uploads",
@@ -433,17 +811,53 @@ async def load_excel(
         message.document.file_name
     )
 
-    await bot.download(
-        message.document,
-        destination=path
-    )
-
-    await message.answer(
-        "Читаю Excel..."
-    )
-
     try:
+        await bot.download(
+            message.document,
+            destination=path
+        )
 
+        await message.answer("Читаю Excel...")
+
+        if upload_type == "bells":
+            df = pd.read_excel(path, header=None)
+            bells = {}
+
+            for row in range(1, len(df)):
+                raw_lesson = df.iloc[row, 0] if len(df.columns) > 0 else None
+                raw_time = df.iloc[row, 1] if len(df.columns) > 1 else None
+
+                if pd.isna(raw_lesson) or pd.isna(raw_time):
+                    continue
+
+                try:
+                    lesson_no = int(raw_lesson)
+                except (TypeError, ValueError):
+                    continue
+
+                bell_time = str(raw_time).strip()
+                if not bell_time:
+                    continue
+
+                bells[str(lesson_no)] = bell_time
+
+            if not bells:
+                raise ValueError("В файле не найдено расписание звонков")
+
+            save_bell_schedule(bells)
+
+            await message.answer(
+                "✅ Расписание звонков добавлено!\n\n"
+                f"Уроков: {len(bells)}"
+            )
+            await send_main_menu(
+                message,
+                message.from_user.id,
+                message.from_user.username
+            )
+            return
+
+        # Обычная загрузка расписания
         df = pd.read_excel(
             path,
             header=None
@@ -453,111 +867,36 @@ async def load_excel(
 
         classes = []
 
-        for col in range(
-            2,
-            len(df.columns),
-            3
-        ):
+        for col in range(2, len(df.columns), 3):
+            cls = str(df.iloc[1, col]).strip()
 
-            cls = str(
-                df.iloc[1, col]
-            ).strip()
-
-            if (
-                cls
-                and
-                cls.lower() != "nan"
-            ):
-
-                classes.append(
-                    (
-                        cls.lower(),
-                        col
-                    )
-                )
+            if cls and cls.lower() != "nan":
+                classes.append((cls.lower(), col))
 
         count = 0
 
-        for row in range(
-            2,
-            len(df)
-        ):
+        for row in range(2, len(df)):
+            day = str(df.iloc[row, 0]).strip()
 
-            day = str(
-                df.iloc[row, 0]
-            ).strip()
-
-            if (
-                not day
-                or
-                day.lower() == "nan"
-            ):
-
+            if not day or day.lower() == "nan":
                 continue
 
             try:
-
-                lesson = int(
-                    df.iloc[row, 1]
-                )
-
-            except:
-
+                lesson = int(df.iloc[row, 1])
+            except Exception:
                 continue
 
             for cls, col in classes:
+                subject = df.iloc[row, col]
+                cabinet = df.iloc[row, col + 1]
+                teacher = df.iloc[row, col + 2]
 
-                subject = (
-                    df.iloc[row, col]
-                )
-
-                cabinet = (
-                    df.iloc[
-                        row,
-                        col + 1
-                    ]
-                )
-
-                teacher = (
-                    df.iloc[
-                        row,
-                        col + 2
-                    ]
-                )
-
-                if pd.isna(
-                    subject
-                ):
-
+                if pd.isna(subject):
                     continue
 
-                subject = str(
-                    subject
-                ).strip()
-
-                if pd.isna(
-                    cabinet
-                ):
-
-                    cabinet = ""
-
-                else:
-
-                    cabinet = str(
-                        cabinet
-                    ).strip()
-
-                if pd.isna(
-                    teacher
-                ):
-
-                    teacher = ""
-
-                else:
-
-                    teacher = str(
-                        teacher
-                    ).strip()
+                subject = str(subject).strip()
+                cabinet = "" if pd.isna(cabinet) else str(cabinet).strip()
+                teacher = "" if pd.isna(teacher) else str(teacher).strip()
 
                 add_schedule(
                     day,
@@ -574,16 +913,23 @@ async def load_excel(
             "✅ Расписание загружено!\n\n"
             f"Уроков: {count}\n"
             f"Классов: {len(classes)}\n"
-            "Учителя сохранены.",
-            reply_markup=main_menu(True)
+            "Учителя сохранены."
+        )
+        await send_main_menu(
+            message,
+            message.from_user.id,
+            message.from_user.username
         )
 
     except Exception as e:
-
         await message.answer(
             f"❌ Ошибка:\n{e}"
         )
-
+        await send_main_menu(
+            message,
+            message.from_user.id,
+            message.from_user.username
+        )
 
 
 # Изменить расписание
@@ -607,8 +953,12 @@ async def edit(callback: types.CallbackQuery):
     if not classes:
         await callback.answer()
         await callback.message.edit_text(
-            "⚠️ Сначала загрузите расписание.",
-            reply_markup=main_menu(True)
+            "Сначала загрузите расписание."
+        )
+        await send_main_menu(
+            callback.message,
+            callback.from_user.id,
+            callback.from_user.username
         )
         return
 
@@ -626,6 +976,13 @@ async def edit(callback: types.CallbackQuery):
         ])
 
     await callback.answer()
+    buttons.append([
+        InlineKeyboardButton(
+            text="Назад",
+            callback_data="back_main"
+        )
+    ])
+
     await callback.message.edit_text(
         "Выберите класс:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -686,6 +1043,13 @@ async def edit_class(
 
     await callback.answer()
 
+    buttons.append([
+        InlineKeyboardButton(
+            text="Назад",
+            callback_data=f"back_edit_class:{class_name}"
+        )
+    ])
+
     await callback.message.edit_text(
         f"{class_name.upper()}\n\n"
         "Выберите день:",
@@ -695,9 +1059,9 @@ async def edit_class(
     )
 
 
-# =====================
+
 # Выбор урока
-# =====================
+
 
 @dp.callback_query(
     F.data.startswith(
@@ -761,6 +1125,13 @@ async def edit_day(
         ])
 
     await callback.answer()
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="Назад",
+            callback_data=f"back_edit_day:{class_name}:{day}"
+        )
+    ])
 
     await callback.message.edit_text(
         f"{class_name.upper()}\n"
@@ -846,6 +1217,13 @@ async def edit_lesson(
 
     await callback.answer()
 
+    buttons.append([
+        InlineKeyboardButton(
+            text="Назад",
+            callback_data=f"back_edit_day:{class_name}:{day}"
+        )
+    ])
+
     await callback.message.edit_text(
         f"{class_name.upper()}\n"
         f"{day}\n"
@@ -923,6 +1301,15 @@ async def change_teacher(
 
     await callback.answer()
 
+    buttons.append([
+        InlineKeyboardButton(
+            text="Назад",
+            callback_data=(
+                f"back_edit_lesson:{class_name}:{day}:{lesson}"
+            )
+        )
+    ])
+
     await callback.message.edit_text(
         "Выберите свободного учителя:",
         reply_markup=InlineKeyboardMarkup(
@@ -964,21 +1351,32 @@ async def pick_teacher(
         "teachers"
     ][index]
 
-    set_schedule_change(
-        state["class_name"],
-        state["day"],
-        state["lesson"],
-        teacher=teacher,
-        cabinet=None,
-        valid_date=get_week_date(
-            state["day"]
+    try:
+        set_schedule_change(
+            state["class_name"],
+            state["day"],
+            state["lesson"],
+            teacher=teacher,
+            cabinet=None,
+            valid_date=get_week_date(
+                state["day"]
+            )
         )
-    )
 
-    await finish_change(
-        callback,
-        state
-    )
+        await finish_change(
+            callback,
+            state
+        )
+    except Exception as e:
+        await callback.answer("Ошибка", show_alert=True)
+        await callback.message.answer(
+            f"❌ Ошибка изменения расписания:\n{e}"
+        )
+        await send_main_menu(
+            callback.message,
+            callback.from_user.id,
+            callback.from_user.username
+        )
 
 
 # Изменить кабинет
@@ -1046,6 +1444,15 @@ async def change_cabinet(
 
     await callback.answer()
 
+    buttons.append([
+        InlineKeyboardButton(
+            text="Назад",
+            callback_data=(
+                f"back_edit_lesson:{class_name}:{day}:{lesson}"
+            )
+        )
+    ])
+
     await callback.message.edit_text(
         "Выберите свободный кабинет:",
         reply_markup=InlineKeyboardMarkup(
@@ -1088,21 +1495,32 @@ async def pick_cabinet(
         "cabinets"
     ][index]
 
-    set_schedule_change(
-        state["class_name"],
-        state["day"],
-        state["lesson"],
-        teacher=None,
-        cabinet=cabinet,
-        valid_date=get_week_date(
-            state["day"]
+    try:
+        set_schedule_change(
+            state["class_name"],
+            state["day"],
+            state["lesson"],
+            teacher=None,
+            cabinet=cabinet,
+            valid_date=get_week_date(
+                state["day"]
+            )
         )
-    )
 
-    await finish_change(
-        callback,
-        state
-    )
+        await finish_change(
+            callback,
+            state
+        )
+    except Exception as e:
+        await callback.answer("Ошибка", show_alert=True)
+        await callback.message.answer(
+            f"❌ Ошибка изменения расписания:\n{e}"
+        )
+        await send_main_menu(
+            callback.message,
+            callback.from_user.id,
+            callback.from_user.username
+        )
 
 
 # Учитель + кабинет
@@ -1169,6 +1587,15 @@ async def change_both(
         ])
 
     await callback.answer()
+
+    buttons.append([
+        InlineKeyboardButton(
+            text="Назад",
+            callback_data=(
+                f"back_edit_lesson:{class_name}:{day}:{lesson}"
+            )
+        )
+    ])
 
     await callback.message.edit_text(
         "Выберите свободного учителя:",
@@ -1241,6 +1668,15 @@ async def pick_both_teacher(
 
     await callback.answer()
 
+    buttons.append([
+        InlineKeyboardButton(
+            text="Назад",
+            callback_data=(
+                f"back_edit_lesson:{state['class_name']}:{state['day']}:{state['lesson']}"
+            )
+        )
+    ])
+
     await callback.message.edit_text(
         f"{teacher}\n\n"
         "Выберите свободный кабинет:",
@@ -1275,21 +1711,32 @@ async def pick_both_cabinet(
         "cabinets"
     ][index]
 
-    set_schedule_change(
-        state["class_name"],
-        state["day"],
-        state["lesson"],
-        teacher=state["teacher"],
-        cabinet=cabinet,
-        valid_date=get_week_date(
-            state["day"]
+    try:
+        set_schedule_change(
+            state["class_name"],
+            state["day"],
+            state["lesson"],
+            teacher=state["teacher"],
+            cabinet=cabinet,
+            valid_date=get_week_date(
+                state["day"]
+            )
         )
-    )
 
-    await finish_change(
-        callback,
-        state
-    )
+        await finish_change(
+            callback,
+            state
+        )
+    except Exception as e:
+        await callback.answer("Ошибка", show_alert=True)
+        await callback.message.answer(
+            f"❌ Ошибка изменения расписания:\n{e}"
+        )
+        await send_main_menu(
+            callback.message,
+            callback.from_user.id,
+            callback.from_user.username
+        )
 
 # Показать новое расписание
 
@@ -1299,94 +1746,34 @@ async def finish_change(
         state
 ):
 
-    class_name = state[
-        "class_name"
-    ]
+    class_name = state["class_name"]
+    day = state["day"]
 
-    day = state[
-        "day"
-    ]
-
-    valid_date = get_week_date(
-        day
-    )
-
-    changes = {
-        row[0]: row
-
-        for row in get_schedule_changes(
-            class_name,
-            day,
-            valid_date
-        )
-    }
-
-    lessons = get_schedule(
-        class_name,
-        day
-    )
+    clear_old_changes(datetime.today().strftime("%Y-%m-%d"))
+    load_bell_schedule()
 
     text = (
         "✅ Расписание изменено!\n\n"
-        f"{class_name.upper()}\n\n"
-        f"{day} (изменено)\n\n"
+        + format_schedule(class_name, [day])
     )
-
-    for lesson in lessons:
-
-        lesson_no = lesson[0]
-        subject = lesson[1]
-        cabinet = lesson[2]
-        teacher = lesson[3]
-
-        change = changes.get(
-            lesson_no
-        )
-
-        if change:
-
-            if change[1]:
-
-                teacher = change[1]
-
-            if change[2]:
-
-                cabinet = change[2]
-
-        line = (
-            f"{lesson_no} урок - "
-            f"{subject}"
-        )
-
-        if teacher:
-
-            line += (
-                f" — {teacher}"
-            )
-
-        if cabinet:
-
-            line += (
-                f" (каб. {cabinet})"
-            )
-
-        text += (
-            line + "\n"
-        )
 
     edit_state.pop(
         callback.from_user.id,
         None
     )
 
-    await callback.answer(
-        "Готово!"
-    )
+    await callback.answer("✅ Готово!")
 
+    # Сохраняем результат изменения в сообщении и отдельно показываем главное меню.
     await callback.message.edit_text(
-        text
+        schedule_message(text),
+        parse_mode="HTML"
     )
-
+    await send_main_menu(
+        callback.message,
+        callback.from_user.id,
+        callback.from_user.username
+    )
 
 
 # Запуск
@@ -1395,6 +1782,7 @@ async def finish_change(
 async def main():
 
     init_db()
+    load_bell_schedule()
 
     clear_old_changes(
         datetime.today().strftime(
